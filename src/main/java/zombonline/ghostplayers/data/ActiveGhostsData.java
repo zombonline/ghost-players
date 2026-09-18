@@ -4,13 +4,11 @@ import com.mojang.serialization.Codec;
 import com.mojang.serialization.codecs.RecordCodecBuilder;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.UUIDUtil;
-import net.minecraft.core.registries.Registries;
-import net.minecraft.resources.Identifier;
-import net.minecraft.resources.ResourceKey;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.level.saveddata.SavedData;
 import net.minecraft.world.level.saveddata.SavedDataType;
+import zombonline.ghostplayers.GhostBehaviour;
 import zombonline.ghostplayers.GhostPlayers;
 
 import java.util.HashSet;
@@ -22,7 +20,9 @@ public class ActiveGhostsData extends SavedData {
     public record ActiveGhost(
             UUID mannequinId,
             UUID targetID,
-            long lifetimeTicksRemaining
+            long lifetimeTicksRemaining,
+            GhostBehaviour behaviour,
+            BlockPos destination
     ) {
 
         public static final Codec<ActiveGhost> CODEC =
@@ -31,15 +31,27 @@ public class ActiveGhostsData extends SavedData {
                             UUIDUtil.STRING_CODEC.
                                     fieldOf("mannequin_ID")
                                     .forGetter(ActiveGhost::mannequinId),
+
                             UUIDUtil.STRING_CODEC.
                                     fieldOf("targetId").
                                     forGetter(ActiveGhost::targetID),
 
                             Codec.LONG.
                                     fieldOf("lifetime_ticks_remaining")
-                                    .forGetter(ActiveGhost::lifetimeTicksRemaining)
+                                    .forGetter(ActiveGhost::lifetimeTicksRemaining),
+
+                            GhostBehaviour.CODEC
+                                    .fieldOf("behaviour")
+                                    .forGetter(ActiveGhost::behaviour),
+
+                            BlockPos.CODEC
+                                    .fieldOf("destination")
+                                    .forGetter(ActiveGhost::destination)
+
+
                     ).apply(instance, ActiveGhost::new);
                 });
+
     }
 
     private final Set<ActiveGhost> activeGhosts = new HashSet<>();
@@ -65,8 +77,9 @@ public class ActiveGhostsData extends SavedData {
                     null
             );
 
-    public void add(UUID mannequin, UUID target,long lifetime) {
-        activeGhosts.add(new ActiveGhost(mannequin, target, lifetime));
+    public void add(UUID mannequin, UUID target,long lifetime, GhostBehaviour behaviour) {
+        activeGhosts.add(new ActiveGhost(mannequin, target, lifetime, behaviour, BlockPos.ZERO));
+        GhostPlayers.LOGGER.info("Active ghost stored in data, current count {}", activeGhosts.size());
     }
     public void remove(UUID mannequin) {
         activeGhosts.removeIf(ghost -> ghost.mannequinId.equals(mannequin));
@@ -88,6 +101,16 @@ public class ActiveGhostsData extends SavedData {
         return level
                 .getDataStorage()
                 .computeIfAbsent(TYPE);
+    }
+
+    public void setDestination(ActiveGhost ghostToUpdate, BlockPos newDestination) {
+        var newGhost = new ActiveGhost(ghostToUpdate.mannequinId,
+                ghostToUpdate.targetID,
+                ghostToUpdate.lifetimeTicksRemaining,
+                ghostToUpdate.behaviour,
+                newDestination);
+        activeGhosts.remove(ghostToUpdate);
+        activeGhosts.add(newGhost);
     }
 
 }
