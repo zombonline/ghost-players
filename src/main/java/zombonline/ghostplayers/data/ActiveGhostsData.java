@@ -22,7 +22,8 @@ public class ActiveGhostsData extends SavedData {
             UUID targetID,
             long lifetimeTicksRemaining,
             GhostBehaviour behaviour,
-            BlockPos destination
+            BlockPos destination,
+            long ticksInPlayerView
     ) {
 
         public static final Codec<ActiveGhost> CODEC =
@@ -46,10 +47,15 @@ public class ActiveGhostsData extends SavedData {
 
                             BlockPos.CODEC
                                     .fieldOf("destination")
-                                    .forGetter(ActiveGhost::destination)
+                                    .forGetter(ActiveGhost::destination),
+
+                            Codec.LONG.
+                                    fieldOf("ticks_in_player_view")
+                                    .forGetter(ActiveGhost::ticksInPlayerView)
 
 
-                    ).apply(instance, ActiveGhost::new);
+
+                            ).apply(instance, ActiveGhost::new);
                 });
 
     }
@@ -71,14 +77,14 @@ public class ActiveGhostsData extends SavedData {
 
     private static final SavedDataType<ActiveGhostsData> TYPE =
             new SavedDataType<>(
-                    GhostPlayers.id("ghost_players"),
+                    GhostPlayers.id("active_ghosts"),
                     ActiveGhostsData::new,
                     CODEC,
                     null
             );
 
     public void add(UUID mannequin, UUID target,long lifetime, GhostBehaviour behaviour) {
-        activeGhosts.add(new ActiveGhost(mannequin, target, lifetime, behaviour, BlockPos.ZERO));
+        activeGhosts.add(new ActiveGhost(mannequin, target, lifetime, behaviour, BlockPos.ZERO, 0l));
         GhostPlayers.LOGGER.info("Active ghost stored in data, current count {}", activeGhosts.size());
     }
     public void remove(UUID mannequin) {
@@ -108,7 +114,18 @@ public class ActiveGhostsData extends SavedData {
                 ghostToUpdate.targetID,
                 ghostToUpdate.lifetimeTicksRemaining,
                 ghostToUpdate.behaviour,
-                newDestination);
+                newDestination,
+                ghostToUpdate.ticksInPlayerView);
+        activeGhosts.remove(ghostToUpdate);
+        activeGhosts.add(newGhost);
+    }
+    public void incrementTicksInPlayerView(ActiveGhost ghostToUpdate) {
+        var newGhost = new ActiveGhost(ghostToUpdate.mannequinId,
+                ghostToUpdate.targetID,
+                ghostToUpdate.lifetimeTicksRemaining,
+                ghostToUpdate.behaviour,
+                ghostToUpdate.destination,
+                ghostToUpdate.ticksInPlayerView+1);
         activeGhosts.remove(ghostToUpdate);
         activeGhosts.add(newGhost);
     }

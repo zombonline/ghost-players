@@ -3,7 +3,9 @@ package zombonline.ghostplayers;
 import com.mojang.authlib.GameProfile;
 import net.fabricmc.api.ModInitializer;
 
+import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
+import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
 import net.minecraft.commands.arguments.EntityAnchorArgument;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.component.DataComponentType;
@@ -12,10 +14,9 @@ import net.minecraft.network.syncher.EntityDataSerializers;
 import net.minecraft.resources.Identifier;
 
 import net.minecraft.server.level.ServerLevel;
-import net.minecraft.world.entity.Entity;
-import net.minecraft.world.entity.EntitySpawnReason;
-import net.minecraft.world.entity.EntityTypes;
-import net.minecraft.world.entity.MoverType;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.server.network.ServerPlayerConnection;
+import net.minecraft.world.entity.*;
 import net.minecraft.world.entity.ai.attributes.AttributeInstance;
 import net.minecraft.world.entity.ai.attributes.AttributeModifier;
 import net.minecraft.world.entity.ai.attributes.Attributes;
@@ -28,7 +29,9 @@ import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec3;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import zombonline.ghostplayers.config.GhostPlayersConfig;
 import zombonline.ghostplayers.data.ActiveGhostsData;
+import zombonline.ghostplayers.data.GhostProfilesData;
 
 import java.util.HashSet;
 import java.util.Random;
@@ -39,42 +42,39 @@ public class GhostPlayers implements ModInitializer {
 	public static final String MOD_ID = "ghost-players";
 
 	public static final Logger LOGGER = LoggerFactory.getLogger(MOD_ID);
+	public static GhostProfilesData ghostProfilesData;
+	public static ActiveGhostsData activeGhostsData;
+	public static SpawnManager spawnManager;
+	public static GhostPlayersConfig config;
 
 	@Override
 	public void onInitialize() {
+		config = GhostPlayersConfig.load();
+		spawnManager = new SpawnManager();
+
+		ServerLifecycleEvents.SERVER_STARTED.register(server -> {
+			ghostProfilesData = GhostProfilesData.get(server);
+			activeGhostsData = ActiveGhostsData.get(server);
+			spawnManager.init(server);
+
+
+		});
+		ServerPlayConnectionEvents.JOIN.register((listener, sender, server) -> {
+					if(!config.addNewJoinedPlayersToProfilePool)
+						return;
+					ServerPlayer player = listener.getPlayer();
+					ghostProfilesData.addPlayer(player);
+				}
+		);
+
 		ServerTickEvents.END_SERVER_TICK.register((server) -> {
-			if(ActiveGhostsData.get(server).getActiveGhosts().stream().count() <= 0) {
-				var player = server.overworld().getRandomPlayer();
-				if(player == null) {
+			spawnManager.onTick(server);
 
-					LOGGER.info("No player found.");
-					return;
-				}
-				LOGGER.info("Creating mann at {}", player.getName().getString());
-				Mannequin mannequin = EntityTypes.MANNEQUIN.create(server.overworld(), EntitySpawnReason.MOB_SUMMONED);
-				var pos = getPositionNearby(server.overworld(), player);
-				if(pos == null)
-					return;
-				mannequin.setPos(Vec3.atCenterOf(pos));
-				LOGGER.info("mannequin summoned with uuid {} at {}", mannequin.getStringUUID(), (mannequin.getX() +", " + mannequin.getY() + ", " + mannequin.getZ()));
-                GameProfile profile = player.getGameProfile();
-				var resolve = ResolvableProfile.createResolved(profile);
-				var profileAccessor = EntityDataSerializers.RESOLVABLE_PROFILE.createAccessor(17);
-				mannequin.getEntityData().set(profileAccessor, resolve);
-//				mannequin.setNoGravity(true);
-				AttributeInstance stepup = mannequin.getAttribute(Attributes.STEP_HEIGHT);
-				if (stepup != null) {
-					stepup.setBaseValue(3);
-				}
-				server.overworld().addFreshEntity(mannequin);
-				ActiveGhostsData.get(server).add(mannequin.getUUID(), player.getUUID(), 500, GhostBehaviour.RUN_PAST);
+			var activeGhostSnapshot = new HashSet<>(ActiveGhostsData.get(server).getActiveGhosts());
+			activeGhostSnapshot.forEach(ghost -> {
+				processActiveGhost(server.overworld(), ghost);
+			});
 
-			} else {
-				var activeGhostSnapshot = new HashSet<>(ActiveGhostsData.get(server).getActiveGhosts());
-				activeGhostSnapshot.forEach(ghost -> {
-					processActiveGhost(server.overworld(), ghost);
-				});
-			}
 
 		});
 		LOGGER.info("Loaded {}", MOD_ID);
@@ -86,24 +86,61 @@ public class GhostPlayers implements ModInitializer {
 			ActiveGhostsData.get(level.getServer()).remove(activeGhost.mannequinId());
 			return;
 		}
+
+		if(entityCanSee(level.getEntity(activeGhost.targetID()), ghostEntity,0.75f)) {
+			ActiveGhostsData.get(level.getServer()).incrementTicksInPlayerView(activeGhost);
+			if(activeGhost.ticksInPlayerView() > 5L) {
+
+				destroyGhost(level, activeGhost.mannequinId());
+				return;
+			}
+		}
+
 		switch (activeGhost.behaviour()) {
 			case RUN_TOWARDS -> runTowards(level, activeGhost);
 			case RUN_PAST -> runPast(level,activeGhost);
 		}
 	}
 
+	public static boolean entityCanSee(Entity viewer, BlockPos blockPos, float viewRange) {
+		return entityCanSee(viewer, Vec3.atCenterOf(blockPos), viewRange);
+	}
+
+	public static boolean entityCanSee(Entity viewer, Entity target, float viewRange) {
+		return entityCanSee(viewer, target.position(), viewRange) || entityCanSee(viewer, target.getEyePosition(), viewRange);
+	}
+
+	public static boolean entityCanSee(Entity viewer, Vec3 targetPos, float viewRange) {
+		Vec3 look = viewer.getLookAngle().normalize();
+
+		Vec3 toTarget = targetPos
+				.subtract(viewer.getEyePosition())
+				.normalize();
+
+		double dot = look.dot(toTarget);
+
+		return dot > 0.7 && viewer.level().clip(
+				new ClipContext(
+						viewer.getEyePosition(),
+						targetPos,
+						ClipContext.Block.VISUAL,
+						ClipContext.Fluid.NONE,
+						viewer
+				)
+		).getType() == HitResult.Type.MISS;
+	}
 	private void runPast(ServerLevel level, ActiveGhostsData.ActiveGhost ghost) {
 
 		var ghostEntity = level.getEntity(ghost.mannequinId());
 		if(ghost.destination() == BlockPos.ZERO) {
 			var playerEntity = level.getEntity(ghost.targetID());
 			var dest = getPositionNearby(level,playerEntity);
-			if(dest== null) {
-				destroyGhost(level,ghost.mannequinId());
-			}
-			ActiveGhostsData.get(level.getServer()).setDestination(ghost, getPositionNearby(level, playerEntity));
+			ActiveGhostsData.get(level.getServer()).setDestination(ghost, dest);
 		}
-		var distance = moveGhost(ghostEntity, Vec3.atCenterOf(ghost.destination()), true);
+		if(ghost.destination() == null) {
+			destroyGhost(level,ghost.mannequinId());
+			return;
+		}		var distance = moveGhost(ghostEntity, Vec3.atCenterOf(ghost.destination()), true);
 		if(distance <= 2d)
 		{
 			destroyGhost(level, ghost.mannequinId());
@@ -127,8 +164,7 @@ public class GhostPlayers implements ModInitializer {
 		var distanceFromPlayer = moveGhost(entity, playerEntity.position(), false);
 		if(distanceFromPlayer <= 2d)
 		{
-			ActiveGhostsData.get(level.getServer()).remove(entity.getUUID());
-			entity.discard();
+			destroyGhost(level, ghost.mannequinId());
 			return;
 		}
 	}
@@ -138,18 +174,18 @@ public class GhostPlayers implements ModInitializer {
 		var distanceSqr = (distanceFromPlayer.x * distanceFromPlayer.x) + (distanceFromPlayer.z * distanceFromPlayer.z);
 
 		var directionVector = distanceFromPlayer.normalize();
-		var horizontalStep = directionVector.multiply(0.45, 0.0, 0.45);
+		var horizontalStep = directionVector.multiply(0.25, 0.0, 0.25);
 		entity.move(MoverType.SELF, horizontalStep);
 		entity.resetFallDistance();
 		if(lookatStepDestnation)
-			entity.lookAt(EntityAnchorArgument.Anchor.EYES, horizontalStep.add(0,1.7,0));
+			entity.lookAt(EntityAnchorArgument.Anchor.EYES, entity.position().add(horizontalStep).add(0,1.7,0));
 		return distanceSqr;
 	}
 
-	private BlockPos getPositionNearby(ServerLevel level, Entity player) {
+	public static BlockPos getPositionNearby(ServerLevel level, Entity player) {
 		var from = player.blockPosition();
-		int MIN_RANGE = 10;
-		int MAX_RANGE = 30;
+		int MIN_RANGE = config.minimumDistance;
+		int MAX_RANGE = config.maximumDistance;
 		int Y_RANGE = 15;
 		int MAX_ATTEMPTS = 10;
 
@@ -181,22 +217,8 @@ public class GhostPlayers implements ModInitializer {
 					continue;
 				}
 
-				Vec3 start = player.getEyePosition();
-				Vec3 end = Vec3.atCenterOf(feet.above());
-
-				ClipContext context = new ClipContext(
-						start,
-						end,
-						ClipContext.Block.VISUAL,
-						ClipContext.Fluid.NONE,
-						player
-				);
-
-				BlockHitResult hit = level.clip(context);
-
-				if (hit.getType() != HitResult.Type.MISS) {
+				if(entityCanSee(player, feet, 0.6f) || entityCanSee(player, feet.above(),0.6f))
 					continue;
-				}
 
 				return feet;
 			}
